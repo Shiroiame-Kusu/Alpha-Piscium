@@ -211,7 +211,17 @@ programs {
             cond("SETTING_GI_INITIAL_SST_STEPS >= 64")
         }
         pass("/pass/composite/GIReSTIRTemporalReuse.comp.glsl")
-        pass("/pass/composite/GIReSTIRSpatialReuse.comp.glsl")
+        pass("/pass/composite/GIReSTIRDuplicationMapDecorrelate.comp.glsl") {
+            cond("defined(SETTING_GI_DECORRELATE)")
+        }
+        for (i in 0..7) {
+            pass("/pass/composite/GIReSTIRPairedSpatialReuse.comp.glsl") {
+                constDefine("PASS_INDEX", i.toString())
+                indirect(0, 48)
+                cond("defined(SETTING_GI_SPATIAL_REUSE) && SETTING_GI_SPATIAL_REUSE_COUNT > $i")
+            }
+        }
+        pass("/pass/composite/GIReSTIRPairedSpatialShade.comp.glsl")
         pass("/pass/composite/GIReSTIRSpatialReuseRaySort.comp.glsl")
         pass("/pass/composite/GIReSTIRSpatialReuseTrace.comp.glsl")
         pass("/pass/composite/GIDenoiserAccum.comp.glsl")
@@ -222,8 +232,12 @@ programs {
             indirect(0, 16)
         }
         pass("/pass/composite/GIDenoiserHistoryFix.comp.glsl")
-        pass("/pass/composite/GIDenoiserBlur.comp.glsl")
-        pass("/pass/composite/GIDenoiserPostBlur.comp.glsl")
+        pass("/pass/composite/GIDenoiserBlur.comp.glsl") {
+            cond("defined(SETTING_DENOISER_SPATIAL)")
+        }
+        pass("/pass/composite/GIDenoiserPostBlur.comp.glsl") {
+            cond("defined(SETTING_DENOISER_SPATIAL)")
+        }
         pass("/pass/composite/SSTStepDebug.comp.glsl") {
             cond("defined(SETTING_DEBUG_SST_STEPS)")
         }

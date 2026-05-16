@@ -94,6 +94,9 @@ Material material_decode(GBufferData gData) {
 
     emissivePBR = pow(emissivePBR, SETTING_EMISSIVE_PBR_VALUE_CURVE);
 
+    #ifndef MATERIAL_TRANSLUCENT
+    roughness = max(roughness, 0.001);
+    #endif
     material.roughness = roughness;
 
     bool dielectric = gData.pbrSpecular.g < (229.5 / 255.0);

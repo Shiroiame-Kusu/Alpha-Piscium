@@ -23,10 +23,13 @@
 #include "/util/Sampling.glsl"
 #include "/techniques/HiZCheck.glsl"
 #include "/util/ThreadGroupTiling.glsl"
+#include "/util/BSDF.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
 const vec2 workGroupsRender = vec2(1.0, 1.0);
 
+layout(rgba16f) uniform writeonly image2D uimg_temp1;
+layout(rgba16f) uniform writeonly image2D uimg_temp3;
 layout(rgba16f) uniform restrict image2D uimg_rgba16f;
 layout(r32f) uniform restrict writeonly image2D uimg_r32f;
 layout(rgba32ui) uniform restrict uimage2D uimg_rgba32ui;
@@ -36,17 +39,19 @@ shared mat3 shared_prevViewToCurrView;
 shared vec3 shared_prevViewToCurrViewTrans;
 
 void sampleTemporalNeighbor(
-    ivec2 texelPos,
-    ivec2 neighborTexelPos,
-    float combinedWeight,
-    uint randSeedOffset,
-    vec3 viewPos,
-    vec3 normal,
-    bool oddFrame,
-    inout ReSTIRReservoir reservoir,
-    inout float wSum,
-    inout vec4 prevSample,
-    inout f16vec3 prevHitNormal
+ivec2 texelPos,
+ivec2 neighborTexelPos,
+float combinedWeight,
+uint randSeedOffset,
+vec3 viewPos,
+vec3 V,
+vec3 centerNormal,
+ResampleMaterial material,
+bool oddFrame,
+inout ReSTIRReservoir reservoir,
+inout float wSum,
+inout vec4 prevSample,
+inout f16vec3 prevHitNormal
 ) {
     if (combinedWeight > 0.0) {
         uvec4 prevTemporalReservoirData = oddFrame
@@ -90,7 +95,7 @@ void sampleTemporalNeighbor(
                     float cosPhiA = -dot(dirA, neighborHitNormal);
                     float cosPhiB = -dot(dirB, neighborHitNormal);
                     float jacobian = 1.0;
-                    if (cosPhiA <= 0.0 || dot(normal, dirA) <= 0.0) {
+                    if (cosPhiA <= 0.0 || dot(centerNormal, dirA) <= 0.0) {
                         jacobian = 0.0;
                     } else if (cosPhiB > 5e-2) {
                         jacobian = min((RB2 * cosPhiA) / (hitDist2 * cosPhiB), 256.0);
@@ -103,8 +108,7 @@ void sampleTemporalNeighbor(
 
             if (valid) {
                 vec4 neighborSample = history_restir_prevSample_fetch(neighborTexelPos);
-                float brdf = saturate(dot(normal, neighborReservoir.Y.xyz)) * RCP_PI;
-                float neighborPHat = length(neighborSample.xyz) * brdf;
+                float neighborPHat = evalTargetFunction(neighborSample.rgb, centerNormal, neighborReservoir.Y.xyz, V, material);
 
                 neighborReservoir.m *= combinedWeight;
                 // Reduces weight further if the target function is much diff from the hisotry footprint
@@ -140,11 +144,13 @@ void main() {
     barrier();
 
     if (all(lessThan(texelPos, uval_mainImageSizeI))) {
-        uvec4 packedReservoir = uvec4(0u);
+        ReSTIRReservoir temporalReservoir = restir_initReservoir();
         float viewZ = hiz_groupGroundCheckSubgroupLoadViewZ(swizzledWGPos.xy, 4, texelPos);
         if (viewZ > -65536.0) {
             vec2 screenPos = coords_texelToUV(texelPos, uval_mainImageSizeRcp);
             vec3 viewPos = coords_toViewCoord(screenPos, viewZ, global_camProjInverse);
+
+            vec3 V = normalize(-viewPos);
 
             vec4 prevSample = vec4(0.0);
             f16vec3 prevHitNormal = f16vec3(0.0);
@@ -153,8 +159,11 @@ void main() {
             uvec4 reprojInfoData = transient_gi_diffuse_reprojInfo_fetch(texelPos);
             ReprojectInfo reprojInfo = reprojectInfo_unpack(reprojInfoData);
             float ageResetRand = rand_stbnVec1(rand_newStbnPos(texelPos, RANDOM_FRAME / 64u + 1u), RANDOM_FRAME);
-            ReSTIRReservoir temporalReservoir = restir_initReservoir();
             if (reprojInfo.historyResetFactor > ageResetRand) {
+                vec3 centerNormal = normalize(transient_viewNormal_fetch(texelPos).xyz * 2.0 - 1.0);
+                ResampleMaterial material = resampleMaterial_unpack(transient_restir_resampleMaterial_fetch(texelPos));
+
+                uint baseRandSeed = RANDOM_FRAME / 64u + 2u;
                 vec2 curr2PrevTexelPos = reprojInfo.curr2PrevScreenPos * uval_mainImageSize;
                 curr2PrevTexelPos = clamp(curr2PrevTexelPos, vec2(0.5), uval_mainImageSize - 0.5);
                 vec2 gatherTexelPos = floor(curr2PrevTexelPos - 0.5) + 1.0;
@@ -167,12 +176,7 @@ void main() {
                 bilinearWeights4.zw *= 1.0 - bilinearWeights2.yy;
 
                 ivec2 iGatherTexelPos = ivec2(gatherTexelPos);
-                uint baseRandSeed = RANDOM_FRAME / 64u + 2u;
                 bool oddFrame = bool(frameCounter & 1);
-
-                GBufferData gData = gbufferData_init();
-                gbufferData1_unpack(texelFetch(usam_gbufferSolidData1, texelPos, 0), gData);
-                vec3 normal = gData.normal;
 
                 // 4-tap bilinear temporal gather
                 // Layout (gather order matches bilinearWeights xyzw):
@@ -182,19 +186,19 @@ void main() {
                 //   w = bottom-left  iGatherTexelPos + (-1, -1)
                 {
                     float combinedWeight = bilinearWeights4.x * reprojInfo.bilateralWeights.x * reprojInfo.historyResetFactor;
-                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(-1, 0), combinedWeight, baseRandSeed, viewPos, normal, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
+                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(-1, 0), combinedWeight, baseRandSeed + 1u, viewPos, V, centerNormal, material, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
                 }
                 {
                     float combinedWeight = bilinearWeights4.y * reprojInfo.bilateralWeights.y * reprojInfo.historyResetFactor;
-                    sampleTemporalNeighbor(texelPos, iGatherTexelPos, combinedWeight, baseRandSeed + 1u, viewPos, normal, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
+                    sampleTemporalNeighbor(texelPos, iGatherTexelPos, combinedWeight, baseRandSeed + 2u, viewPos, V, centerNormal, material, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
                 }
                 {
                     float combinedWeight = bilinearWeights4.z * reprojInfo.bilateralWeights.z * reprojInfo.historyResetFactor;
-                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(0, -1), combinedWeight, baseRandSeed + 2u, viewPos, normal, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
+                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(0, -1), combinedWeight, baseRandSeed + 3u, viewPos, V, centerNormal, material, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
                 }
                 {
                     float combinedWeight = bilinearWeights4.w * reprojInfo.bilateralWeights.w * reprojInfo.historyResetFactor;
-                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(-1, -1), combinedWeight, baseRandSeed + 3u, viewPos, normal, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
+                    sampleTemporalNeighbor(texelPos, iGatherTexelPos + ivec2(-1, -1), combinedWeight, baseRandSeed + 4u, viewPos, V, centerNormal, material, oddFrame, temporalReservoir, wSum, prevSample, prevHitNormal);
                 }
             }
 
@@ -207,7 +211,8 @@ void main() {
                 Material material = material_decode(gData);
 
                 float hitDistance = transient_gi_initialSampleHitDistance_fetch(texelPos).x;
-                restir_InitialSampleData initialSample = restir_initalSample_restoreData(texelPos, viewZ, gData.geomNormal, material, hitDistance);
+                restir_InitialSampleData initialSample = restir_initalSample_restoreData(texelPos, viewZ, gData.geomNormal, gData.normal, material, hitDistance);
+                ResampleMaterial resampleMaterial = resampleMaterial_fromMaterial(material);
                 vec3 hitRadiance = initialSample.hitRadiance;
                 vec3 sampleDirView = initialSample.directionAndLength.xyz;
 
@@ -222,10 +227,9 @@ void main() {
                     transient_gi_initialSampleHitDistance_store(texelPos, vec4(-1.0));
                 }
 
-                float brdf = saturate(dot(gData.normal, sampleDirView)) * RCP_PI;
-                float newPHat = length(hitRadiance) * brdf;
+                float newPHat = evalTargetFunction(hitRadiance, gData.normal, sampleDirView, V, resampleMaterial);
 
-                float samplePdf = brdf;
+                float samplePdf = initialSample.pdf;
                 float newWi = newPHat * safeRcp(samplePdf);
 
                 float reservoirRand1 = rand_stbnVec1(rand_newStbnPos(texelPos, RANDOM_FRAME / 64u + 6u), RANDOM_FRAME);
@@ -249,25 +253,49 @@ void main() {
                 float avgWSum = wSum * safeRcp(temporalReservoir.m);
                 temporalReservoir.avgWY = avgWSum * safeRcp(finalSample.w);
                 temporalReservoir.m = clamp(temporalReservoir.m, 0.0, float(SETTING_GI_TEMPORAL_REUSE_LIMIT));
-                packedReservoir = restir_reservoir_pack(temporalReservoir);
 
+                #if USE_REFERENCE || !defined(SETTING_GI_SPATIAL_REUSE)
                 #if USE_REFERENCE
-                vec4 ssgiOut = vec4(hitRadiance, hitDistance);
-                ssgiOut.rgb = clamp(ssgiOut.rgb, 0.0, FP16_MAX);
-                transient_ssgiOut_store(texelPos, ssgiOut);
-                #elif !defined(SETTING_GI_SPATIAL_REUSE)
+                vec3 winL = sampleDirView;
+                float winHitDist = hitDistance;
+                vec3 winR = hitRadiance * safeRcp(samplePdf);
+                #else
                 vec3 winL = temporalReservoir.Y.xyz;
                 float winHitDist = temporalReservoir.Y.w;
+                vec3 winR = finalSample.rgb * temporalReservoir.avgWY;
+                #endif
+                vec3 H_win = normalize(winL + V);
 
                 float winNDotL = saturate(dot(gData.normal, winL));
-                float winDiffBRDF = winNDotL * RCP_PI;
+                float winNDotV = saturate(dot(gData.normal, V));
+                float winNDotH = saturate(dot(gData.normal, H_win));
+                float winLDotH = abs(dot(winL, H_win));
 
-                vec4 ssgiOut = vec4(finalSample.rgb * winDiffBRDF * temporalReservoir.avgWY, winHitDist);
-                ssgiOut.rgb = clamp(ssgiOut.rgb, 0.0, FP16_MAX);
-                transient_ssgiOut_store(texelPos, ssgiOut);
+                ResampleBRDF winBRDF = resampleMaterial_evalBRDF(resampleMaterial, winNDotL, winNDotV, winNDotH, winLDotH);
+                float diffRatio = winBRDF.diffuse * safeRcp(winBRDF.full);
+
+                vec3 totalOutput = winR * winBRDF.full;
+                vec4 ssgiDiffOut = vec4(totalOutput * diffRatio, winHitDist);
+
+                vec4 ssgiSpecOut = vec4(totalOutput * (1.0 - diffRatio), winHitDist);
+                vec3 specAlbedo = resampleMaterial_specularAlbedo(resampleMaterial, winNDotV);
+                ssgiSpecOut.rgb *= safeRcp(specAlbedo);
+
+                ssgiDiffOut = clamp(ssgiDiffOut, 0.0, FP16_MAX);
+                ssgiSpecOut = clamp(ssgiSpecOut, 0.0, FP16_MAX);
+
+                transient_ssgiDiffOut_store(texelPos, ssgiDiffOut);
+                transient_ssgiSpecOut_store(texelPos, ssgiSpecOut);
                 #endif
             }
         }
+        PairwiseMISMetadata meta = pairwiseMISMetadata_init(texelPos);
+        if (!restir_isReservoirValid(temporalReservoir)) {
+            temporalReservoir.Y.w = -1.0;
+        }
+        meta.accumM = temporalReservoir.m;
+        transient_restir_pairwiseMISMetadata_store(texelPos, pairwiseMISMetadata_pack(meta));
+        uvec4 packedReservoir = restir_reservoir_pack(temporalReservoir);
         if (bool(frameCounter & 1)) {
             history_restir_reservoirTemporal1_store(texelPos, packedReservoir);
         } else {

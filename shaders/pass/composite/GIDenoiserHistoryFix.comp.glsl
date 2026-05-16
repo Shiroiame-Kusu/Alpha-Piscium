@@ -81,7 +81,7 @@ void loadSharedDataMoments(uvec2 groupOriginTexelPos, uint index) {
         }
 
         vec2 hitDistances = vec2(diffData.w, specData.w);
-        hitDistances = mix(vec2(MAX_HIT_DISTANCE), hitDistances, greaterThan(hitDistances, vec2(0.0)));
+        hitDistances = mix(vec2(GI_MAX_HIT_DISTANCE), hitDistances, greaterThan(hitDistances, vec2(0.0)));
         shared_hitDistances[sharedXY.y][sharedXY.x] = hitDistances;
     }
 }
@@ -95,6 +95,7 @@ void main() {
     uvec2 mortonPos = morton_8bDecode(threadIdx);
     uvec2 mortonGlobalPosU = workGroupOrigin + mortonPos;
     ivec2 texelPos = ivec2(mortonGlobalPosU);
+    history_edgeMask_store(texelPos, transient_edgeMask_fetch(texelPos));
 
     if (hiz_groupGroundCheck(swizzledWGPos, 4)) {
         loadSharedDataMoments(workGroupOrigin, gl_LocalInvocationIndex);
@@ -180,20 +181,22 @@ void main() {
                         specWeightedSum = max(specWeightedSum, vec4(0.0));
 
                         historyData.diffuseColor = mix(diffWeightedSum.rgb, historyData.diffuseColor, historyFixMix);
-                        historyData.specularColor = mix(specWeightedSum.rgb, historyData.specularColor, historyFixMix);
+                        // historyData.specularColor = mix(specWeightedSum.rgb, historyData.specularColor, historyFixMix);
                     }
                 }
                 #endif
 
                 barrier();
                 float ditherNoise = rand_stbnVec1(rand_newStbnPos(texelPos, 2u), frameCounter);
-                vec2 filteredHitDitances = vec2(MAX_HIT_DISTANCE);
                 #ifdef SETTING_DENOISER_FAST_HISTORY_CLAMPING
                 {
                     vec3 diffMoment1 = vec3(0.0);
                     vec3 diffMoment2 = vec3(0.0);
                     vec3 specMoment1 = vec3(0.0);
                     vec3 specMoment2 = vec3(0.0);
+                    #ifdef SETTING_DENOISER_SPATIAL
+                    vec2 filteredHitDitances = vec2(GI_MAX_HIT_DISTANCE);
+                    #endif
 
                     ivec2 localPos = ivec2(mortonPos) + 2; // +2 for padding
                     // 5x5 neighborhood using shared memory
@@ -211,18 +214,29 @@ void main() {
                             specMoment1 += neighborSpecYCoCg;
                             specMoment2 += neighborSpecYCoCg * neighborSpecYCoCg;
                             vec2 neighborHitDistances = vec2(diffData.w, specData.w);
+                            #ifdef SETTING_DENOISER_SPATIAL
                             filteredHitDitances = min(filteredHitDitances, neighborHitDistances);
+                            #endif
                         }
                     }
+                    #ifdef SETTING_DENOISER_SPATIAL
+                    // Adding 0.0001 to avoid making it 0 which can cause issues with pow
+                    vec2 hitDitanceFactors = 1.00001 - pow2(smoothstep(4.0, 0.0, filteredHitDitances));
+                    vec2 hlen = vec2(historyData.realHistoryLength);
+                    hlen.y = min(hlen.y, historyData.specularHistoryLength);
+                    vec2 remappedRealHLen = 1.0 - pow4(1.0 - hlen);
+                    remappedRealHLen *= vec2(0.5, 1.0);
+                    hitDitanceFactors = pow(hitDitanceFactors, remappedRealHLen);
+                    transient_gi_hitDistanceFactors_store(texelPos, vec4(saturate(hitDitanceFactors), 0.0, 0.0));
+                    #endif
 
                     diffMoment1 /= 25.0;
                     diffMoment2 /= 25.0;
                     specMoment1 /= 25.0;
                     specMoment2 /= 25.0;
 
-                    float totalLen = historyData.historyLength * TOTAL_HISTORY_LENGTH;
-                    float decayFactor = linearStep(FAST_HISTORY_LENGTH * 2.0, 1.0, totalLen);
-                    float clampingThreshold = mix(2.0, 4.0, pow2(decayFactor));
+                    float totalLen = historyData.realHistoryLength * TOTAL_HISTORY_LENGTH;
+                    float decayFactor = linearStep(SETTING_DENOISER_FAST_HISTORY_LENGTH * 2.0, 1.0, totalLen);
 
                     float expMul = exp2(global_aeData.expValues.z);
 
@@ -231,53 +245,101 @@ void main() {
                         uvec4 centerData = shared_YCoCgData[localPos.y][localPos.x];
                         vec4 centerDiffData = unpackHalf4x16(centerData.xy);
                         vec4 centerSpecData = unpackHalf4x16(centerData.zw);
-                        imageStore(uimg_temp2, texelPos, vec4(colors_YCoCgToRGB(centerDiffData.rgb), 0.0));
+//                        imageStore(uimg_temp2, texelPos, vec4(colors_YCoCgToRGB(centerDiffData.rgb), 0.0));
                     }
                     #endif
 
-                    vec3 diffClamped = _clampColor(historyData.diffuseColor, diffMoment1, diffMoment2, clampingThreshold);
+                    float diffClampingThreshold = mix(2.0, 4.0, pow2(decayFactor));
+                    vec3 diffClamped = _clampColor(historyData.diffuseColor, diffMoment1, diffMoment2, diffClampingThreshold);
                     vec3 diffOutputSim = colors_reversibleTonemap(historyData.diffuseColor * expMul);
                     vec3 diffDiff = abs(colors_reversibleTonemap(diffClamped * expMul) - diffOutputSim);
                     float diffDiffLuma = colors2_colorspaces_luma(SETTING_WORKING_COLOR_SPACE, diffDiff);
                     diffClamped = mix(historyData.diffuseColor, diffClamped, historyFixMix);
                     historyData.diffuseColor = diffClamped;
+
+                    #ifdef SETTING_DENOISER_SPATIAL
                     vec4 diffInput = vec4(historyData.diffuseColor, colors2_colorspaces_luma(SETTING_WORKING_COLOR_SPACE, diffOutputSim));
                     diffInput = dither_fp16(diffInput, ditherNoise);
                     transient_gi_blurDiff2_store(texelPos, diffInput);
+                    #else
+                    transient_gi_diffShadingOutput_store(texelPos, vec4(historyData.diffuseColor, 0.0));
+                    vec4 packedData1 = gi_historyData_pack1(historyData);
+                    packedData1 = dither_fp16(packedData1, ditherNoise);
+                    history_gi1_store(texelPos, packedData1);
+                    #endif
 
-                    vec3 specClamped = _clampColor(historyData.specularColor, specMoment1, specMoment2, clampingThreshold);
+                    float specClampingThreshold = mix(2.0, 4.0, pow2(decayFactor));
+                    vec3 specClamped = _clampColor(historyData.specularColor, specMoment1, specMoment2, specClampingThreshold);
                     vec3 specOutputSim = colors_reversibleTonemap(historyData.specularColor * expMul);
                     vec3 specDiff = abs(colors_reversibleTonemap(specClamped * expMul) - specOutputSim);
                     float specDiffLuma = colors2_colorspaces_luma(SETTING_WORKING_COLOR_SPACE, specDiff);
                     specClamped = mix(historyData.specularColor, specClamped, historyFixMix);
                     historyData.specularColor = specClamped;
+
+                    #ifdef SETTING_DENOISER_SPATIAL
                     vec4 specInput = vec4(historyData.specularColor, colors2_colorspaces_luma(SETTING_WORKING_COLOR_SPACE, specOutputSim));
                     specInput = dither_fp16(specInput, ditherNoise);
                     transient_gi_blurSpec2_store(texelPos, specInput);
+                    #else
+                    transient_gi_specShadingOutput_store(texelPos, vec4(historyData.specularColor, 0.0));
+                    vec4 packedData3 = gi_historyData_pack3(historyData);
+                    packedData3 = dither_fp16(packedData3, ditherNoise);
+                    history_gi3_store(texelPos, packedData3);
+                    #endif
 
-                    vec2 diffLuma2 = vec2(diffDiffLuma, specDiffLuma);
-
+                    #ifdef SETTING_DENOISER_SPATIAL
                     vec2 denoiserBlurVariance = sqrt(vec2(diffDiffLuma, specDiffLuma));
                     transient_gi_denoiseVariance1_store(texelPos, vec4(denoiserBlurVariance, 0.0, 0.0));
+                    #endif
 
+                    vec2 diffLuma2 = vec2(diffDiffLuma, specDiffLuma);
                     vec2 resetFactor2 = smoothstep(0.5, 0.0, diffLuma2);
                     float resetFactor = resetFactor2.x * resetFactor2.y;
-                    resetFactor = pow(resetFactor, historyData.historyLength) * 0.9 + 0.1;
-                    historyData.historyLength *= resetFactor;
-                    historyData.realHistoryLength *= sqrt(resetFactor);
+                    float diffResetFactor = pow(resetFactor, historyData.historyLength) * 0.9 + 0.1;
+                    float specResetFactor = pow(resetFactor, historyData.specularHistoryLength) * 0.9 + 0.1;
+                    historyData.historyLength *= diffResetFactor;
+                    historyData.specularHistoryLength *= specResetFactor;
+                    historyData.realHistoryLength *= sqrt((diffResetFactor + specResetFactor) * 0.5);
+
+                    vec4 packedData5 = gi_historyData_pack5(historyData);
+                    packedData5 = dither_u8(packedData5, ditherNoise);
+                    #ifdef SETTING_DENOISER_SPATIAL
+                    transient_gi5Reprojected_store(texelPos, packedData5);
+                    #else
+                    history_gi5_store(texelPos, packedData5);
+                    #endif
                 }
                 #else
                 {
+                    vec4 packedData5 = gi_historyData_pack5(historyData);
+                    packedData5 = dither_u8(packedData5, ditherNoise);
+                    #ifdef SETTING_DENOISER_SPATIAL
+                    transient_gi5Reprojected_store(texelPos, packedData5);
+                    #else
+                    history_gi5_store(texelPos, packedData5);
+                    #endif
+
+                    #ifdef SETTING_DENOISER_SPATIAL
+                    vec2 filteredHitDitances = vec2(GI_MAX_HIT_DISTANCE);
                     ivec2 localPos = ivec2(mortonPos) + 2; // +2 for padding
                     // 5x5 neighborhood using shared memory
                     for (int dy = -2; dy <= 2; ++dy) {
                         for (int dx = -2; dx <= 2; ++dx) {
                             ivec2 samplePos = localPos + ivec2(dx, dy);
                             vec2 neighborHitDistances = shared_hitDistances[samplePos.y][samplePos.x];
-                            neighborHitDistances = mix(vec2(MAX_HIT_DISTANCE), neighborHitDistances, greaterThan(neighborHitDistances, vec2(0.0)));
+                            neighborHitDistances = mix(vec2(GI_MAX_HIT_DISTANCE), neighborHitDistances, greaterThan(neighborHitDistances, vec2(0.0)));
                             filteredHitDitances = min(filteredHitDitances, neighborHitDistances);
                         }
                     }
+                    // Adding 0.0001 to avoid making it 0 which can cause issues with pow
+                    vec2 hitDitanceFactors = 1.00001 - pow2(smoothstep(4.0, 0.0, filteredHitDitances));
+                    vec2 hlen = vec2(historyData.realHistoryLength);
+                    hlen.y = min(hlen.y, historyData.specularHistoryLength);
+                    vec2 remappedRealHLen = 1.0 - pow4(1.0 - hlen);
+                    remappedRealHLen *= vec2(0.5, 1.0);
+                    hitDitanceFactors = pow(hitDitanceFactors, remappedRealHLen);
+                    transient_gi_hitDistanceFactors_store(texelPos, vec4(saturate(hitDitanceFactors), 0.0, 0.0));
+
                     float expMul = exp2(global_aeData.expValues.z);
                     vec3 diffOutputSim = colors_reversibleTonemap(historyData.diffuseColor * expMul);
                     vec3 specOutputSim = colors_reversibleTonemap(historyData.specularColor * expMul);
@@ -286,19 +348,19 @@ void main() {
                     vec4 specInput = vec4(historyData.specularColor, colors2_colorspaces_luma(SETTING_WORKING_COLOR_SPACE, specOutputSim));
                     transient_gi_blurSpec2_store(texelPos, specInput);
                     transient_gi_denoiseVariance1_store(texelPos, vec4(0.0));
+                    #else
+                    transient_gi_diffShadingOutput_store(texelPos, vec4(historyData.diffuseColor, 0.0));
+                    vec4 packedData1 = gi_historyData_pack1(historyData);
+                    packedData1 = dither_fp16(packedData1, ditherNoise);
+                    history_gi1_store(texelPos, packedData1);
+
+                    transient_gi_specShadingOutput_store(texelPos, vec4(historyData.specularColor, 0.0));
+                    vec4 packedData3 = gi_historyData_pack3(historyData);
+                    packedData3 = dither_fp16(packedData3, ditherNoise);
+                    history_gi3_store(texelPos, packedData3);
+                    #endif
                 }
                 #endif
-
-                // Adding 0.0001 to avoid making it 0 which can cause issues with pow
-                vec2 hitDitanceFactors = 1.00001 - pow4(smoothstep(4.0, 0.0, filteredHitDitances));
-                float remappedRealHLen = 1.0 - pow4(1.0 - historyData.realHistoryLength);
-                hitDitanceFactors = pow(hitDitanceFactors, vec2(remappedRealHLen * 2.0));
-                transient_gi_hitDistanceFactors_store(texelPos, vec4(saturate(hitDitanceFactors), 0.0, 0.0));
-
-                vec4 packedData5 = gi_historyData_pack5(historyData);
-                packedData5 = dither_u8(packedData5, ditherNoise);
-
-                transient_gi5Reprojected_store(texelPos, packedData5);
             }
         }
     }

@@ -76,7 +76,7 @@ float bsdf_smithG1(float ndotv, float alpha) {
     // Simplied version of the above
     float alphaSq = alpha * alpha;
     float ndotvSq = ndotv * ndotv;
-    float denom = ndotv + sqrt(ndotvSq - alphaSq * ndotvSq + alphaSq);
+    float denom = ndotv + sqrt(ndotvSq -alphaSq * ndotvSq + alphaSq);
     return 2.0 * ndotv / denom;
 }
 
