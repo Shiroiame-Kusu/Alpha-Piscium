@@ -113,6 +113,9 @@ void main() {
                 float historyLengthInt = historyData.realHistoryLength * TOTAL_HISTORY_LENGTH;
                 // 0.0 = Full fix, 1.0 = No fix
                 float historyFixMix = pow2(linearStep(1.0, 4.0, historyLengthInt));
+                #if SETTING_DEBUG_OUTPUT
+                imageStore(uimg_temp1, texelPos, 1.0 - historyFixMix.xxxx);
+                #endif
 
                 #ifdef SETTING_DENOISER_HISTORY_FIX
                 if (historyFixMix < 1.0) {
@@ -299,7 +302,7 @@ void main() {
                     float specResetFactor = pow(resetFactor, historyData.specularHistoryLength) * 0.9 + 0.1;
                     historyData.historyLength *= diffResetFactor;
                     historyData.specularHistoryLength *= specResetFactor;
-                    historyData.realHistoryLength *= sqrt((diffResetFactor + specResetFactor) * 0.5);
+                    historyData.realHistoryLength *= sqrt(diffResetFactor * specResetFactor) * 0.5 + 0.5;
 
                     vec4 packedData5 = gi_historyData_pack5(historyData);
                     packedData5 = dither_u8(packedData5, ditherNoise);
