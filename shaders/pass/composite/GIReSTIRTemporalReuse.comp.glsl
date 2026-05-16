@@ -24,6 +24,7 @@
 #include "/techniques/HiZCheck.glsl"
 #include "/util/ThreadGroupTiling.glsl"
 #include "/util/BSDF.glsl"
+#include "/techniques/gi/PairwiseMIS.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
 const vec2 workGroupsRender = vec2(1.0, 1.0);
@@ -39,19 +40,19 @@ shared mat3 shared_prevViewToCurrView;
 shared vec3 shared_prevViewToCurrViewTrans;
 
 void sampleTemporalNeighbor(
-ivec2 texelPos,
-ivec2 neighborTexelPos,
-float combinedWeight,
-uint randSeedOffset,
-vec3 viewPos,
-vec3 V,
-vec3 centerNormal,
-ResampleMaterial material,
-bool oddFrame,
-inout ReSTIRReservoir reservoir,
-inout float wSum,
-inout vec4 prevSample,
-inout f16vec3 prevHitNormal
+    ivec2 texelPos,
+    ivec2 neighborTexelPos,
+    float combinedWeight,
+    uint randSeedOffset,
+    vec3 viewPos,
+    vec3 V,
+    vec3 centerNormal,
+    ResampleMaterial material,
+    bool oddFrame,
+    inout ReSTIRReservoir reservoir,
+    inout float wSum,
+    inout vec4 prevSample,
+    inout f16vec3 prevHitNormal
 ) {
     if (combinedWeight > 0.0) {
         uvec4 prevTemporalReservoirData = oddFrame

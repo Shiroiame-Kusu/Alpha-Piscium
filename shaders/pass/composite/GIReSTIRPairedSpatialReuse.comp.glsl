@@ -1,3 +1,11 @@
+/*
+    References:
+        [LKW26] Lin, Daqi, et al. "ReSTIR PT Enhanced: Algorithmic Advances for Faster and More Robust ReSTIR Path Tracing".
+            Proceedings of the ACM on Computer Graphics and Interactive Techniques. 9, 1, Article 13 (2026).
+            https://doi.org/10.1145/3804494
+
+        You can find full license texts in /licenses
+*/
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
@@ -8,6 +16,7 @@
 #include "/util/Rand.glsl"
 #include "/util/Mat2.glsl"
 #include "/techniques/gi/Reservoir.glsl"
+#include "/techniques/gi/PairwiseMIS.glsl"
 
 layout(local_size_x = 128) in;
 

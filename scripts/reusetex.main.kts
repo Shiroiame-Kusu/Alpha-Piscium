@@ -1,3 +1,11 @@
+/*
+    References:
+        [LKW26] Lin, Daqi, et al. "ReSTIR PT Enhanced: Algorithmic Advances for Faster and More Robust ReSTIR Path Tracing".
+            Proceedings of the ACM on Computer Graphics and Interactive Techniques. 9, 1, Article 13 (2026).
+            https://doi.org/10.1145/3804494
+
+        You can find full license texts in /licenses
+*/
 @file:DependsOn("org.apache.commons:commons-rng-simple:1.6")
 
 import org.apache.commons.rng.UniformRandomProvider
