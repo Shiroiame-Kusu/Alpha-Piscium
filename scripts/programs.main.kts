@@ -86,6 +86,7 @@ class ProgramScope internal constructor() {
                     appendLine("#include \"$shaderPath\"")
                 }
                 outputPath.writeText(text)
+                println("$passName\t$shaderPath")
             }
         }
     }
