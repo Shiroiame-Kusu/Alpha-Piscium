@@ -13,6 +13,7 @@
         "viewHeight",
         "gbufferProjectionInverse"
     ],
+    "samplers": {},
 	"opaqueDrawBuffers": [16],
 	"translucentDrawBuffers": [17, 18],
     "blending": {
